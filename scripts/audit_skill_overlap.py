@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import itertools
 import re
+import sys
 from pathlib import Path
 
 STOP = {"about", "after", "also", "and", "any", "are", "before", "by", "can", "for", "from", "into", "its", "not", "of", "on", "or", "the", "to", "use", "when", "with", "work", "your", "this", "that", "where", "which", "while"}
@@ -34,6 +35,9 @@ def main() -> int:
     if not 0 < args.threshold <= 1:
         parser.error("--threshold must be between 0 and 1")
     files = sorted((args.root / "skills").glob("*/SKILL.md"))
+    if not files:
+        print(f"[FAIL] No SKILL.md files found under {args.root / 'skills'}", file=sys.stderr)
+        return 1
     sets = {p.parent.name: tokens(p) for p in files}
     hits = []
     for (name_a, set_a), (name_b, set_b) in itertools.combinations(sets.items(), 2):
