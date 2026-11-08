@@ -2,7 +2,7 @@
 """Wait for GitHub pull-request checks to change using the GitHub CLI.
 
 Usage: pr_wait.py <PR number or URL> [--repo owner/name] [--until green|any-change] [--interval 20]
-Requires an authenticated `gh` CLI. This checks CI status only; it does not inspect review threads
+Requires an authenticated GitHub CLI. This checks CI status only; it does not inspect review threads
 or certify that a PR is merge-ready.
 """
 from __future__ import annotations
@@ -13,21 +13,24 @@ import re
 import subprocess
 import sys
 import time
-from typing import Sequence
+from typing import Collection, Sequence
 
 PR_URL = re.compile(r"https?://github\.com/([^/]+/[^/]+)/pull/(\d+)(?:[/?#].*)?")
-REPO_NAME = re.compile(r"[\w.-]+/[\w.-]+")
+REPO_NAME = re.compile(r"[A-Za-z0-9-]+/[A-Za-z0-9._-]+")
+CHECK_BUCKETS = {"pass", "fail", "pending", "skipping", "cancel"}
 
 
-def run_gh(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
-    """Run gh and return its captured result, surfacing actionable errors."""
+def run_gh(
+    args: Sequence[str], *, allowed_returncodes: Collection[int] = (0,)
+) -> subprocess.CompletedProcess[str]:
+    """Run gh and allow only explicitly documented command-specific exit codes."""
     try:
         result = subprocess.run(
             ["gh", *args], text=True, capture_output=True, check=False
         )
     except FileNotFoundError as exc:
-        raise RuntimeError("GitHub CLI `gh` is not installed or not on PATH") from exc
-    if result.returncode != 0:
+        raise RuntimeError("GitHub CLI gh is not installed or not on PATH") from exc
+    if result.returncode not in allowed_returncodes:
         message = result.stderr.strip() or result.stdout.strip()
         raise RuntimeError(message or f"gh exited with status {result.returncode}")
     return result
@@ -38,8 +41,10 @@ def resolve_pr(pr: str, repo_arg: str | None) -> tuple[str, str]:
     value = pr.strip()
     match = PR_URL.fullmatch(value)
     if match:
-        repo = repo_arg or match.group(1)
-        number = match.group(2)
+        url_repo, number = match.groups()
+        if repo_arg and repo_arg.casefold() != url_repo.casefold():
+            raise ValueError("--repo must match the repository in the pull-request URL")
+        repo = url_repo
     elif value.isdigit():
         repo = repo_arg
         number = value
@@ -55,6 +60,41 @@ def resolve_pr(pr: str, repo_arg: str | None) -> tuple[str, str]:
     return repo, number
 
 
+def get_check_snapshot(number: str, repo: str) -> tuple[tuple[str, str, str], ...]:
+    """Fetch one check snapshot, including gh's documented non-zero status codes.
+
+    gh pr checks may return 1 when checks fail and 8 while checks are pending.
+    Those are check outcomes, not command failures; parse the JSON in both cases.
+    """
+    result = run_gh(
+        ["pr", "checks", number, "--repo", repo, "--json", "name,bucket,link"],
+        allowed_returncodes=(0, 1, 8),
+    )
+    if result.returncode != 0 and not result.stdout.strip():
+        detail = result.stderr.strip() or f"gh exited with status {result.returncode} without JSON output"
+        raise RuntimeError(detail)
+    try:
+        rows = json.loads(result.stdout or "[]")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"gh returned invalid JSON: {exc}") from exc
+    if not isinstance(rows, list):
+        raise RuntimeError("gh returned an unexpected check payload: expected a JSON array")
+
+    state = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise RuntimeError(f"gh returned an invalid check at index {index}: expected an object")
+        bucket = str(row.get("bucket", "pending")).lower()
+        if bucket not in CHECK_BUCKETS:
+            raise RuntimeError(f"gh returned an unsupported check bucket: {bucket!r}")
+        state.append((
+            str(row.get("name", "?")),
+            bucket,
+            str(row.get("link", "")),
+        ))
+    return tuple(sorted(state))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("pr", help="pull-request number or URL")
@@ -68,20 +108,7 @@ def main() -> int:
     repo, number = resolve_pr(args.pr, args.repo)
     previous: tuple[tuple[str, str, str], ...] | None = None
     while True:
-        payload = run_gh(
-            ["pr", "checks", number, "--repo", repo, "--json", "name,bucket,link"]
-        ).stdout
-        try:
-            rows = json.loads(payload or "[]")
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(f"gh returned invalid JSON: {exc}") from exc
-        if not isinstance(rows, list):
-            raise RuntimeError("gh returned an unexpected check payload")
-
-        state = tuple(sorted(
-            (str(row.get("name", "?")), str(row.get("bucket", "pending")).lower(), str(row.get("link", "")))
-            for row in rows if isinstance(row, dict)
-        ))
+        state = get_check_snapshot(number, repo)
         if state != previous:
             changed_after_initial_snapshot = previous is not None
             summary = ", ".join(f"{name}={status}" for name, status, _ in state)
