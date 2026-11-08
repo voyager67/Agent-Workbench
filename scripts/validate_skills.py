@@ -86,6 +86,8 @@ def validate_sources(path: Path, skill_names: List[str]) -> List[str]:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         return [f"{path}: cannot read valid JSON: {exc}"]
+    if not isinstance(data, dict):
+        return [f"{path}: top-level JSON value must be an object"]
     upstream = data.get("upstream_sources")
     mapping = data.get("skill_sources")
     if not isinstance(upstream, dict) or not isinstance(mapping, dict):
@@ -94,10 +96,12 @@ def validate_sources(path: Path, skill_names: List[str]) -> List[str]:
         if not isinstance(source, dict):
             errors.append(f"{path}: source '{source_id}' must be an object")
             continue
-        if not str(source.get("url", "")).startswith("https://"):
+        url = source.get("url")
+        if not isinstance(url, str) or not url.startswith("https://"):
             errors.append(f"{path}: source '{source_id}' must have an HTTPS URL")
         for required in ("license", "role"):
-            if not str(source.get(required, "")).strip():
+            value = source.get(required)
+            if not isinstance(value, str) or not value.strip():
                 errors.append(f"{path}: source '{source_id}' is missing '{required}'")
     missing = sorted(set(skill_names) - set(mapping))
     extra = sorted(set(mapping) - set(skill_names))
@@ -120,7 +124,9 @@ def validate_sources(path: Path, skill_names: List[str]) -> List[str]:
         if entry["relationship"] != "original" and not refs:
             errors.append(f"{path}: inspired skill {skill} must list at least one source")
         for ref in refs:
-            if ref not in upstream:
+            if not isinstance(ref, str):
+                errors.append(f"{path}: source references for {skill} must be strings")
+            elif ref not in upstream:
                 errors.append(f"{path}: {skill} references unknown source '{ref}'")
     return errors
 
